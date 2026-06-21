@@ -1,3 +1,23 @@
+"""
+SmartGuard - Raspberry Pi MQTT Listener & Fault Classifier
+----------------------------------------------------------
+Subscribes to: smartguard/sensors
+Publishes to:  smartguard/processed
+
+Runs the 4 algorithms on every incoming reading:
+  1. BFS          - fault propagation across transformer components
+  2. Dijkstra     - maintenance priority routing
+  3. KMP          - fault pattern detection in event stream
+  4. Greedy       - minimum component isolation set
+
+Install dependencies:
+  pip install paho-mqtt
+  (no other external deps needed)
+
+Run:
+  python3 listener.py
+"""
+
 import json
 import time
 import heapq
@@ -12,7 +32,7 @@ PUB_TOPIC = "smartguard/processed"
 
 # ─── Thresholds (mirror of ESP32, Pi does the deeper logic) ───────────────
 MQ2_SMOKE   = 1500
-MQ4_GAS     = 2000
+MQ4_GAS     = 1200
 MQ7_CO      = 1000
 TEMP_WARN   = 55.0
 TEMP_CRIT   = 70.0
@@ -48,7 +68,8 @@ GRAPH = {
 # Event codes:
 #   H = heat warning    C = heat critical
 #   S = smoke           G = gas
-#   O = CO warning      N = normal (no flags)
+#   O = CO warning       V = vibration
+#   N = normal (no flags)
 
 FAULT_PATTERNS = {
     "thermal_buildup":    list("HHC"),       # heat warning × 2 then critical
@@ -56,16 +77,19 @@ FAULT_PATTERNS = {
     "gas_then_smoke":     list("GGS"),        # gas leak escalating to smoke
     "thermal_runaway":    list("HCHC"),       # oscillating critical heat
     "compound_fault":     list("OHSC"),       # CO → heat → smoke → critical
+    "loose_mounting":     list("VVH"),        # vibration escalating into heat
+    "mechanical_fault":   list("VVV"),        # sustained vibration alone
 }
 
 # ─── Isolation Sets for Greedy Set Cover ──────────────────────────────────
 # Maps fault type → which components need isolation
 FAULT_ISOLATION = {
-    "smoke":    {"winding1", "winding2", "insulation1", "insulation2"},
-    "gas":      {"winding1", "winding2", "core"},
-    "co":       {"insulation1", "insulation2", "core"},
-    "heat":     {"winding1", "winding2"},
-    "normal":   set(),
+    "smoke":      {"winding1", "winding2", "insulation1", "insulation2"},
+    "gas":        {"winding1", "winding2", "core"},
+    "co":         {"insulation1", "insulation2", "core"},
+    "heat":       {"winding1", "winding2"},
+    "vibration":  {"core", "casing"},
+    "normal":     set(),
 }
 
 # ─── Event Stream (rolling window for KMP) ────────────────────────────────
@@ -80,6 +104,8 @@ def infer_fault_origin(flags):
         return "insulation1"    # CO = insulation degradation
     if flags["heat_critical"] or flags["heat_warning"]:
         return "core"
+    if flags.get("vibration"):
+        return "casing"         # loose mounting / mechanical fault, external
     return None
 
 
@@ -220,6 +246,8 @@ def classify_severity(flags):
         return "CRITICAL"
     if flags["gas"] or flags["heat_warning"] or flags["co"]:
         return "WARNING"
+    if flags.get("vibration"):
+        return "WARNING"
     return "SAFE"
 
 def flags_to_event_code(flags):
@@ -228,6 +256,7 @@ def flags_to_event_code(flags):
     if flags["gas"]:            return "G"
     if flags["co"]:             return "O"
     if flags["heat_warning"]:   return "H"
+    if flags.get("vibration"):  return "V"
     return "N"
 
 def get_active_faults(flags):
@@ -236,6 +265,7 @@ def get_active_faults(flags):
     if flags["gas"]:          faults.append("gas")
     if flags["co"]:           faults.append("co")
     if flags["heat_warning"] or flags["heat_critical"]: faults.append("heat")
+    if flags.get("vibration"): faults.append("vibration")
     return faults if faults else ["normal"]
 
 
@@ -244,10 +274,11 @@ def get_active_faults(flags):
 # Called on every MQTT message from ESP32
 # ══════════════════════════════════════════════════════════════════════════
 def process(payload: dict) -> dict:
-    flags    = payload.get("flags", {})
-    temp     = payload.get("temp", {})
-    humidity = payload.get("humidity", {})
-    gas      = payload.get("gas", {})
+    flags     = payload.get("flags", {})
+    temp      = payload.get("temp", {})
+    humidity  = payload.get("humidity", {})
+    gas       = payload.get("gas", {})
+    actuators = payload.get("actuators", {})
 
     # ── Event stream update ───────────────────────────────────────────────
     event_code = flags_to_event_code(flags)
@@ -279,6 +310,7 @@ def process(payload: dict) -> dict:
     if flags.get("co"):             score -= 15
     if flags.get("gas"):            score -= 25
     if flags.get("smoke"):          score -= 40
+    if flags.get("vibration"):      score -= 15
     # humidity penalty
     max_hum = max(
         humidity.get("h1", 0),
@@ -312,6 +344,11 @@ def process(payload: dict) -> dict:
             },
         },
 
+        "actuators": {
+            "fan_on":       actuators.get("fan_on", False),
+            "power_cut_on": actuators.get("power_cut_on", False),
+        },
+
         "raw": {
             "temp":     temp,
             "humidity": humidity,
@@ -342,12 +379,14 @@ def on_message(client, userdata, msg):
 
         # Console summary
         alg = result["algorithms"]
+        act = result["actuators"]
         print(
             f"[{result['severity']:<8}] score={result['health_score']:3d}  "
             f"event={result['event_code']}  "
             f"origin={alg['bfs']['fault_origin'] or '-':<12}  "
             f"at_risk={alg['bfs']['at_risk']}  "
-            f"patterns={alg['kmp']['patterns_matched']}"
+            f"patterns={alg['kmp']['patterns_matched']}  "
+            f"fan={act['fan_on']}  cut={act['power_cut_on']}"
         )
 
     except Exception as e:
